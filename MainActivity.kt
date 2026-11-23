@@ -47,6 +47,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -59,6 +60,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 
 enum class Marketplace(
@@ -160,60 +162,61 @@ private object PriceSearchEngine {
             .filter { it.isNotBlank() }
             .joinToString(" ")
 
-        val notices = mutableListOf<String>()
+        val notices = Collections.synchronizedList(mutableListOf<String>())
         val collected = mutableListOf<ProductOffer>()
 
         val activeMarkets = if (selectedMarkets.isEmpty()) Marketplace.entries.toSet() else selectedMarkets
 
         coroutineScope {
-            val wbJob = if (enableDirectWb && Marketplace.WILDBERRIES in activeMarkets) {
-                async {
+            val jobs = mutableListOf<Deferred<List<ProductOffer>>>()
+
+            if (enableDirectWb && Marketplace.WILDBERRIES in activeMarkets) {
+                jobs.add(async {
                     try {
                         searchWildberries(fullQuery)
                     } catch (e: Exception) {
                         notices.add("Wildberries напрямую: временно недоступен (${e.message?.take(60) ?: "ошибка сети"})")
-                        emptyList()
+                        emptyList<ProductOffer>()
                     }
-                }
-            } else null
+                })
+            }
 
-            val serperShoppingJob = if (serperKey.isNotBlank() && enableSerperShopping) {
-                async {
+            if (serperKey.isNotBlank() && enableSerperShopping) {
+                jobs.add(async {
                     try {
                         searchSerperShopping(fullQuery, serperKey.trim())
                     } catch (e: Exception) {
                         notices.add("Serper Shopping: ${e.message?.take(80) ?: "ошибка"}")
-                        emptyList()
+                        emptyList<ProductOffer>()
                     }
-                }
-            } else null
+                })
+            }
 
-            val serperOrganicJob = if (serperKey.isNotBlank()) {
-                async {
+            if (serperKey.isNotBlank()) {
+                jobs.add(async {
                     try {
                         searchSerperMarketplaces(fullQuery, activeMarkets, serperKey.trim())
                     } catch (e: Exception) {
                         notices.add("Serper Поиск: ${e.message?.take(80) ?: "ошибка"}")
-                        emptyList()
+                        emptyList<ProductOffer>()
                     }
-                }
-            } else null
+                })
+            }
 
-            val serpApiYandexJob = if (serpApiKey.isNotBlank()) {
-                async {
+            if (serpApiKey.isNotBlank()) {
+                jobs.add(async {
                     try {
                         searchSerpApiYandex(fullQuery, activeMarkets, serpApiKey.trim())
                     } catch (e: Exception) {
                         notices.add("SerpApi Яндекс: ${e.message?.take(80) ?: "ошибка"}")
-                        emptyList()
+                        emptyList<ProductOffer>()
                     }
-                }
-            } else null
+                })
+            }
 
-            wbJob?.await()?.let { collected.addAll(it) }
-            serperShoppingJob?.await()?.let { collected.addAll(it) }
-            serperOrganicJob?.await()?.let { collected.addAll(it) }
-            serpApiYandexJob?.await()?.let { collected.addAll(it) }
+            for (job in jobs) {
+                collected.addAll(job.await())
+            }
         }
 
         // Убираем дубликаты по ссылке, отдавая приоритет карточкам с найденной ценой
@@ -228,7 +231,7 @@ private object PriceSearchEngine {
 
         SearchOutcome(
             offers = deduped.values.toList(),
-            notices = notices
+            notices = notices.toList()
         )
     }
 
@@ -384,7 +387,6 @@ private object PriceSearchEngine {
                 val priceStr = item.optString("price", "")
                 val parsedPrice = parsePriceStringRub(priceStr)
                 if (parsedPrice == null && FOREIGN_CURRENCY_REGEX.containsMatchIn(priceStr)) {
-                    // Пропускаем иностранные долларовые/евро предложения, чтобы не путать сортировку в ₽
                     continue
                 }
                 val marketplace = detectMarketplace(link, source)
@@ -561,7 +563,6 @@ private object PriceSearchEngine {
         for (match in RUB_PRICE_REGEX.findAll(text)) {
             val afterEnd = minOf(text.length, match.range.last + 18)
             val after = text.substring(match.range.last + 1, afterEnd).lowercase()
-            // Игнорируем ежемесячные платежи по рассрочке/кредиту
             if (after.contains("мес") || after.contains("нед")) continue
 
             val digits = match.groupValues[1].filter { it.isDigit() }
@@ -726,7 +727,7 @@ fun PriceFinderApp() {
     var lastSearchedQuery by remember { mutableStateOf("") }
     var lastSearchedSpecs by remember { mutableStateOf("") }
 
-    var selectedMarkets by remember { mutableStateOf(setOf<Marketplace>()) } // пустой = все
+    var selectedMarkets by remember { mutableStateOf(setOf<Marketplace>()) }
     var minPriceText by remember { mutableStateOf("") }
     var maxPriceText by remember { mutableStateOf("") }
     var sortMode by remember { mutableStateOf(SortMode.CHEAPEST) }
@@ -852,7 +853,6 @@ fun PriceFinderApp() {
             contentPadding = PaddingValues(14.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // 1. Карточка поиска
             item {
                 ElevatedCard(
                     shape = RoundedCornerShape(18.dp),
@@ -970,7 +970,6 @@ fun PriceFinderApp() {
                 }
             }
 
-            // 2. Подсказка про ключи для Ozon / Я.Маркет / DNS
             if (!hasAnyApiKey) {
                 item {
                     Card(
@@ -1010,7 +1009,6 @@ fun PriceFinderApp() {
                 }
             }
 
-            // 3. Фильтр по маркетплейсам
             item {
                 val countsByMarket = remember(rawOffers) {
                     rawOffers.groupingBy { it.marketplace }.eachCount()
@@ -1051,7 +1049,6 @@ fun PriceFinderApp() {
                 }
             }
 
-            // 4. Расширенные фильтры (цена от/до, сортировка, строгость)
             if (showAdvancedFilters) {
                 item {
                     ElevatedCard(
@@ -1121,7 +1118,6 @@ fun PriceFinderApp() {
                 }
             }
 
-            // 5. Быстрые переходы напрямую на площадки с сортировкой "Сначала дешёвые"
             val activeQueryForLinks = lastSearchedQuery.ifBlank {
                 listOf(productName.trim(), specsText.trim()).filter { it.isNotBlank() }.joinToString(" ")
             }
@@ -1155,7 +1151,6 @@ fun PriceFinderApp() {
                 }
             }
 
-            // 6. Уведомления / ошибки от движков
             if (notices.isNotEmpty()) {
                 item {
                     Card(
@@ -1178,7 +1173,6 @@ fun PriceFinderApp() {
                 }
             }
 
-            // 7. Заголовок результатов
             if (hasSearched && !isLoading) {
                 item {
                     val cheapestPrice = filteredOffers.mapNotNull { it.priceRub }.minOrNull()
@@ -1209,7 +1203,6 @@ fun PriceFinderApp() {
                 }
             }
 
-            // 8. Список карточек товаров
             if (hasSearched && !isLoading && filteredOffers.isEmpty()) {
                 item {
                     Card(
@@ -1299,7 +1292,6 @@ private fun ProductOfferCard(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.Top
         ) {
-            // Превью фото или цветной значок маркетплейса
             Box(
                 modifier = Modifier
                     .size(86.dp)
@@ -1327,7 +1319,6 @@ private fun ProductOfferCard(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(5.dp)
             ) {
-                // Верхняя строка: бейдж площадки + рейтинг
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -1366,7 +1357,6 @@ private fun ProductOfferCard(
                     }
                 }
 
-                // Название товара
                 Text(
                     text = offer.title,
                     fontWeight = FontWeight.Medium,
@@ -1376,7 +1366,6 @@ private fun ProductOfferCard(
                     lineHeight = 18.sp
                 )
 
-                // Совпадение характеристик
                 if (specTokens.isNotEmpty()) {
                     val allMatched = matchedSpecs == specTokens.size
                     val matchColor = if (allMatched) Color(0xFF2E7D32) else Color(0xFFEF6C00)
@@ -1388,7 +1377,6 @@ private fun ProductOfferCard(
                     )
                 }
 
-                // Цена + кнопка перехода
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
