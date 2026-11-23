@@ -23,12 +23,6 @@ jobs:
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.10.2'
-          cache-provider: basic
-
       - name: Generate Android project
         run: |
           if [ ! -f "MainActivity.kt" ]; then
@@ -193,6 +187,12 @@ jobs:
               <foreground android:drawable="@drawable/ic_launcher_fg" />
           </adaptive-icon>
           EOF
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.10.2'
+          cache-disabled: true
 
       - name: Build Debug APK
         run: |
