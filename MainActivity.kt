@@ -53,6 +53,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -143,7 +144,12 @@ private object PriceSearchEngine {
         .build()
 
     private val RUB_PRICE_REGEX = Regex(
-        """(?<!\d)(\d{1,3}(?:[\s\u00A0\u202F]\d{3})+|\d{3,7})(?:[.,]\d{1,2})?\s*(?:₽|руб\.?|р\.(?!\w))""",
+        """(?<!\d)(\d{1,3}(?:[\s\u00A0\u202F]\d{3})+|\d{3,7})(?:[.,]\d{1,2})?\s*(?:₽|руб(?:лей|\.|)|р\.(?!\w))""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val RUB_PREFIX_REGEX = Regex(
+        """(?:₽|руб\.?)\s*(\d{1,3}(?:[\s\u00A0\u202F]\d{3})+|\d{3,7})(?!\d)""",
         RegexOption.IGNORE_CASE
     )
 
@@ -154,9 +160,11 @@ private object PriceSearchEngine {
         specs: String,
         selectedMarkets: Set<Marketplace>,
         enableDirectWb: Boolean,
-        enableSerperShopping: Boolean,
-        serperKey: String,
-        serpApiKey: String
+        enableTavily: Boolean,
+        enableDuckDuckGo: Boolean,
+        tavilyKey: String,
+        serpKiteKey: String,
+        serperKey: String
     ): SearchOutcome = withContext(Dispatchers.IO) {
         val fullQuery = listOf(productName.trim(), specs.trim())
             .filter { it.isNotBlank() }
@@ -175,18 +183,40 @@ private object PriceSearchEngine {
                     try {
                         searchWildberries(fullQuery)
                     } catch (e: Exception) {
-                        notices.add("Wildberries напрямую: временно недоступен (${e.message?.take(60) ?: "ошибка сети"})")
+                        notices.add("WB напрямую: ${e.message?.take(60) ?: "недоступен"}")
                         emptyList<ProductOffer>()
                     }
                 })
             }
 
-            if (serperKey.isNotBlank() && enableSerperShopping) {
+            if (enableTavily) {
                 jobs.add(async {
                     try {
-                        searchSerperShopping(fullQuery, serperKey.trim())
+                        searchTavily(fullQuery, activeMarkets, tavilyKey.trim())
                     } catch (e: Exception) {
-                        notices.add("Serper Shopping: ${e.message?.take(80) ?: "ошибка"}")
+                        notices.add("Tavily: ${e.message?.take(85) ?: "ошибка"}")
+                        emptyList<ProductOffer>()
+                    }
+                })
+            }
+
+            if (enableDuckDuckGo) {
+                jobs.add(async {
+                    try {
+                        searchDuckDuckGo(fullQuery, activeMarkets)
+                    } catch (e: Exception) {
+                        notices.add("DuckDuckGo: ${e.message?.take(75) ?: "ошибка"}")
+                        emptyList<ProductOffer>()
+                    }
+                })
+            }
+
+            if (serpKiteKey.isNotBlank()) {
+                jobs.add(async {
+                    try {
+                        searchSerpKiteYandex(fullQuery, activeMarkets, serpKiteKey.trim())
+                    } catch (e: Exception) {
+                        notices.add("SerpKite Яндекс: ${e.message?.take(80) ?: "ошибка"}")
                         emptyList<ProductOffer>()
                     }
                 })
@@ -197,18 +227,7 @@ private object PriceSearchEngine {
                     try {
                         searchSerperMarketplaces(fullQuery, activeMarkets, serperKey.trim())
                     } catch (e: Exception) {
-                        notices.add("Serper Поиск: ${e.message?.take(80) ?: "ошибка"}")
-                        emptyList<ProductOffer>()
-                    }
-                })
-            }
-
-            if (serpApiKey.isNotBlank()) {
-                jobs.add(async {
-                    try {
-                        searchSerpApiYandex(fullQuery, activeMarkets, serpApiKey.trim())
-                    } catch (e: Exception) {
-                        notices.add("SerpApi Яндекс: ${e.message?.take(80) ?: "ошибка"}")
+                        notices.add("Serper: ${e.message?.take(80) ?: "ошибка"}")
                         emptyList<ProductOffer>()
                     }
                 })
@@ -219,13 +238,20 @@ private object PriceSearchEngine {
             }
         }
 
-        // Убираем дубликаты по ссылке, отдавая приоритет карточкам с найденной ценой
+        // Дедупликация по ссылке: приоритет у карточек с ценой и фото
         val deduped = LinkedHashMap<String, ProductOffer>()
         for (offer in collected) {
             val normUrl = offer.url.substringBefore("?").trimEnd('/').lowercase()
             val existing = deduped[normUrl]
-            if (existing == null || (existing.priceRub == null && offer.priceRub != null)) {
+            if (existing == null) {
                 deduped[normUrl] = offer
+            } else {
+                val replaceWithPrice = existing.priceRub == null && offer.priceRub != null
+                val replaceWithImage = existing.priceRub == offer.priceRub &&
+                    existing.imageUrl.isNullOrBlank() && !offer.imageUrl.isNullOrBlank()
+                if (replaceWithPrice || replaceWithImage) {
+                    deduped[normUrl] = offer
+                }
             }
         }
 
@@ -249,7 +275,7 @@ private object PriceSearchEngine {
                     .url(url)
                     .header(
                         "User-Agent",
-                        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+                        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
                     )
                     .header("Accept", "application/json, text/plain, */*")
                     .header("Accept-Language", "ru-RU,ru;q=0.9")
@@ -259,12 +285,12 @@ private object PriceSearchEngine {
 
                 client.newCall(request).execute().use { response ->
                     if (!response.isSuccessful) {
-                        lastError = RuntimeException("HTTP ${response.code}")
+                        lastError = RuntimeException("HTTP ${response.code} (если с VPN — попробуйте без него)")
                         return@use
                     }
                     val bodyStr = response.body?.string().orEmpty()
                     if (!bodyStr.trimStart().startsWith("{")) {
-                        lastError = RuntimeException("Защита WB (повторите позже)")
+                        lastError = RuntimeException("защита WB")
                         return@use
                     }
                     val parsed = parseWildberriesJson(bodyStr)
@@ -355,16 +381,259 @@ private object PriceSearchEngine {
         return result
     }
 
-    private fun searchSerperShopping(query: String, apiKey: String): List<ProductOffer> {
-        val payload = JSONObject().apply {
-            put("q", query)
-            put("gl", "ru")
-            put("hl", "ru")
-            put("num", 30)
+    // Tavily Search: работает и в бесплатном режиме без ключа (X-Tavily-Access-Mode: keyless), и с ключом tvly-...
+    private fun searchTavily(
+        query: String,
+        selectedMarkets: Set<Marketplace>,
+        apiKey: String
+    ): List<ProductOffer> {
+        val defaultDomains = listOf(
+            "ozon.ru",
+            "market.yandex.ru",
+            "dns-shop.ru",
+            "citilink.ru",
+            "mvideo.ru",
+            "avito.ru",
+            "wildberries.ru"
+        )
+        val domains = if (Marketplace.OTHER in selectedMarkets) {
+            emptyList()
+        } else {
+            selectedMarkets.mapNotNull { it.domain.takeIf { d -> d.isNotBlank() } }.ifEmpty { defaultDomains }
         }
+
+        val payload = JSONObject().apply {
+            put("query", "$query купить цена рублей")
+            put("search_depth", "basic")
+            put("max_results", if (apiKey.isNotBlank()) 15 else 10)
+            put("include_answer", false)
+            put("include_images", true)
+            if (domains.isNotEmpty()) {
+                val arr = JSONArray()
+                domains.forEach { arr.put(it) }
+                put("include_domains", arr)
+            }
+        }
+
+        val reqBuilder = Request.Builder()
+            .url("https://api.tavily.com/search")
+            .header("Content-Type", "application/json")
+            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+
+        if (apiKey.isNotBlank()) {
+            reqBuilder.header("Authorization", "Bearer $apiKey")
+        } else {
+            reqBuilder.header("X-Tavily-Access-Mode", "keyless")
+        }
+
+        client.newCall(reqBuilder.build()).execute().use { response ->
+            val bodyStr = response.body?.string().orEmpty()
+            if (response.code == 429) {
+                throw RuntimeException(
+                    if (apiKey.isBlank()) "лимит режима без ключа. Вставь бесплатный ключ Tavily или SerpKite в ⚙️"
+                    else "превышен лимит запросов"
+                )
+            }
+            if (!response.isSuccessful) {
+                throw RuntimeException("HTTP ${response.code}")
+            }
+
+            val root = JSONObject(bodyStr)
+            val results = root.optJSONArray("results") ?: return emptyList()
+            val list = mutableListOf<ProductOffer>()
+
+            for (i in 0 until results.length()) {
+                val item = results.optJSONObject(i) ?: continue
+                val title = item.optString("title", "").trim()
+                val url = item.optString("url", "").trim()
+                if (title.isBlank() || url.isBlank()) continue
+
+                val content = item.optString("content", "").trim()
+                val priceRub = extractRubPriceFromText("$title $content")
+                val marketplace = detectMarketplace(url, title)
+
+                // Извлекаем картинку из result.images (может быть строкой или объектом {url})
+                var imageUrl: String? = null
+                val itemImages = item.optJSONArray("images")
+                if (itemImages != null && itemImages.length() > 0) {
+                    val first = itemImages.opt(0)
+                    imageUrl = when (first) {
+                        is JSONObject -> first.optString("url", "").ifBlank { null }
+                        is String -> first.ifBlank { null }
+                        else -> null
+                    }
+                }
+
+                list.add(
+                    ProductOffer(
+                        id = "tavily_$i",
+                        title = cleanTitle(title),
+                        priceRub = priceRub,
+                        marketplace = marketplace,
+                        shopName = extractHostName(url),
+                        url = url,
+                        imageUrl = imageUrl,
+                        snippet = content,
+                        sourceEngine = if (apiKey.isBlank()) "Tavily (без ключа)" else "Tavily"
+                    )
+                )
+            }
+            return list
+        }
+    }
+
+    // DuckDuckGo HTML: прямой поиск без регистрации и без API-ключей
+    private fun searchDuckDuckGo(
+        query: String,
+        selectedMarkets: Set<Marketplace>
+    ): List<ProductOffer> {
+        val domains = selectedMarkets.mapNotNull { it.domain.takeIf { d -> d.isNotBlank() } }
+        val finalQuery = if (domains.isNotEmpty() && Marketplace.OTHER !in selectedMarkets) {
+            val siteClause = domains.take(5).joinToString(" OR ") { "site:$it" }
+            "$query купить цена ($siteClause)"
+        } else {
+            "$query купить цена ozon wildberries яндекс маркет dns ситилинк"
+        }
+
+        val formBody = FormBody.Builder()
+            .add("q", finalQuery)
+            .add("kl", "ru-ru")
+            .build()
+
         val request = Request.Builder()
-            .url("https://google.serper.dev/shopping")
-            .header("X-API-KEY", apiKey)
+            .url("https://html.duckduckgo.com/html/")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+            )
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "ru-RU,ru;q=0.9")
+            .header("Referer", "https://html.duckduckgo.com/")
+            .post(formBody)
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            if (response.code == 202 || response.code == 429) {
+                throw RuntimeException("временная пауза DDG, повтори чуть позже")
+            }
+            if (!response.isSuccessful) {
+                throw RuntimeException("HTTP ${response.code}")
+            }
+
+            val html = response.body?.string().orEmpty()
+            if (html.isBlank()) return emptyList()
+
+            val linkRegex = Regex(
+                """<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>""",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+            )
+            val snippetRegex = Regex(
+                """class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|span)>""",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+            )
+
+            val matches = linkRegex.findAll(html).toList()
+            val list = mutableListOf<ProductOffer>()
+
+            for (idx in matches.indices) {
+                val m = matches[idx]
+                val rawHref = m.groupValues[1]
+                val rawTitle = m.groupValues[2]
+
+                val realUrl = resolveDdgUrl(rawHref) ?: continue
+                if ("duckduckgo.com/" in realUrl) continue
+
+                val sliceStart = m.range.last + 1
+                val sliceEnd = if (idx + 1 < matches.size) matches[idx + 1].range.first else minOf(html.length, sliceStart + 2500)
+                val chunk = if (sliceEnd > sliceStart) html.substring(sliceStart, sliceEnd) else ""
+                val rawSnippet = snippetRegex.find(chunk)?.groupValues?.get(1).orEmpty()
+
+                val title = decodeHtml(rawTitle).trim()
+                val snippet = decodeHtml(rawSnippet).trim()
+                if (title.isBlank()) continue
+
+                val priceRub = extractRubPriceFromText("$title $snippet")
+                val marketplace = detectMarketplace(realUrl, title)
+
+                list.add(
+                    ProductOffer(
+                        id = "ddg_$idx",
+                        title = cleanTitle(title),
+                        priceRub = priceRub,
+                        marketplace = marketplace,
+                        shopName = extractHostName(realUrl),
+                        url = realUrl,
+                        snippet = snippet,
+                        sourceEngine = "DuckDuckGo"
+                    )
+                )
+            }
+            return list
+        }
+    }
+
+    private fun resolveDdgUrl(rawHref: String): String? {
+        val unescaped = rawHref.replace("&amp;", "&").trim()
+        val fullHref = when {
+            unescaped.startsWith("//") -> "https:$unescaped"
+            unescaped.startsWith("/") -> "https://html.duckduckgo.com$unescaped"
+            else -> unescaped
+        }
+        return try {
+            val uri = Uri.parse(fullHref)
+            val uddg = uri.getQueryParameter("uddg")
+            val target = if (!uddg.isNullOrBlank()) uddg else fullHref
+            if (target.startsWith("http://") || target.startsWith("https://")) target else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun decodeHtml(raw: String): String {
+        val noTags = raw.replace(Regex("<[^>]+>"), " ")
+        return noTags
+            .replace("&nbsp;", " ")
+            .replace("&#160;", " ")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&#x27;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&laquo;", "«")
+            .replace("&raquo;", "»")
+            .replace("&ndash;", "–")
+            .replace("&mdash;", "—")
+            .replace("&#8381;", "₽")
+            .replace("&#x20bd;", "₽", ignoreCase = true)
+            .replace(Regex("""\s+"""), " ")
+    }
+
+    // SerpKite API: 2500 бесплатных поисков через GitHub/Google + 1000/мес, умеет искать через Яндекс
+    private fun searchSerpKiteYandex(
+        query: String,
+        selectedMarkets: Set<Marketplace>,
+        apiKey: String
+    ): List<ProductOffer> {
+        val domains = selectedMarkets.mapNotNull { it.domain.takeIf { d -> d.isNotBlank() } }
+        val finalQuery = if (domains.isNotEmpty() && domains.size <= 3 && Marketplace.OTHER !in selectedMarkets) {
+            val siteClause = domains.joinToString(" | ") { "site:$it" }
+            "$query купить цена ($siteClause)"
+        } else {
+            "$query купить цена ozon wildberries яндекс маркет dns ситилинк"
+        }
+
+        val payload = JSONObject().apply {
+            put("q", finalQuery)
+            put("country", "ru")
+            put("language", "ru")
+            put("engine", "yandex")
+            put("num", 20)
+        }
+
+        val request = Request.Builder()
+            .url("https://api.serpkite.com/v1/search")
+            .header("Authorization", "Bearer $apiKey")
             .header("Content-Type", "application/json")
             .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
@@ -372,41 +641,31 @@ private object PriceSearchEngine {
         client.newCall(request).execute().use { response ->
             val bodyStr = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                throw RuntimeException("HTTP ${response.code} (проверь ключ Serper)")
+                throw RuntimeException("HTTP ${response.code} (проверь ключ SerpKite)")
             }
             val root = JSONObject(bodyStr)
-            val shopping = root.optJSONArray("shopping") ?: return emptyList()
+            val results = root.optJSONArray("results") ?: return emptyList()
             val list = mutableListOf<ProductOffer>()
-            for (i in 0 until shopping.length()) {
-                val item = shopping.optJSONObject(i) ?: continue
+            for (i in 0 until results.length()) {
+                val item = results.optJSONObject(i) ?: continue
                 val title = item.optString("title", "").trim()
                 val link = item.optString("link", "").trim()
                 if (title.isBlank() || link.isBlank()) continue
 
-                val source = item.optString("source", "").trim()
-                val priceStr = item.optString("price", "")
-                val parsedPrice = parsePriceStringRub(priceStr)
-                if (parsedPrice == null && FOREIGN_CURRENCY_REGEX.containsMatchIn(priceStr)) {
-                    continue
-                }
-                val marketplace = detectMarketplace(link, source)
-                val rawRating = item.optDouble("rating", Double.NaN)
-                val rating = if (!rawRating.isNaN() && rawRating > 0.0) rawRating else null
-                val ratingCount = item.optInt("ratingCount", 0).takeIf { it > 0 }
+                val snippet = item.optString("snippet", "").trim()
+                val priceRub = extractRubPriceFromText("$title $snippet")
+                val marketplace = detectMarketplace(link, title)
 
                 list.add(
                     ProductOffer(
-                        id = "serper_shop_$i",
-                        title = title,
-                        priceRub = parsedPrice,
+                        id = "serpkite_$i",
+                        title = cleanTitle(title),
+                        priceRub = priceRub,
                         marketplace = marketplace,
-                        shopName = source.ifBlank { marketplace.label },
+                        shopName = extractHostName(link),
                         url = link,
-                        imageUrl = item.optString("imageUrl", "").ifBlank { null },
-                        rating = rating,
-                        reviewsCount = ratingCount,
-                        snippet = item.optString("delivery", ""),
-                        sourceEngine = "Google Shopping"
+                        snippet = snippet,
+                        sourceEngine = "SerpKite Яндекс"
                     )
                 )
             }
@@ -431,7 +690,7 @@ private object PriceSearchEngine {
             put("q", finalQuery)
             put("gl", "ru")
             put("hl", "ru")
-            put("num", 30)
+            put("num", 25)
         }
         val request = Request.Builder()
             .url("https://google.serper.dev/search")
@@ -484,7 +743,7 @@ private object PriceSearchEngine {
                         rating = rating,
                         reviewsCount = ratingCount,
                         snippet = snippet,
-                        sourceEngine = "Google Поиск"
+                        sourceEngine = "Serper"
                     )
                 )
             }
@@ -492,77 +751,21 @@ private object PriceSearchEngine {
         }
     }
 
-    private fun searchSerpApiYandex(
-        query: String,
-        selectedMarkets: Set<Marketplace>,
-        apiKey: String
-    ): List<ProductOffer> {
-        val domains = selectedMarkets.mapNotNull { it.domain.takeIf { d -> d.isNotBlank() } }
-        val finalQuery = if (domains.isNotEmpty() && domains.size <= 3 && Marketplace.OTHER !in selectedMarkets) {
-            val siteClause = domains.joinToString(" | ") { "site:$it" }
-            "$query купить цена ($siteClause)"
-        } else {
-            "$query купить цена ozon wildberries яндекс маркет dns ситилинк"
-        }
+    fun extractRubPriceFromText(rawText: String): Int? {
+        val text = rawText
+            .replace("*", " ")
+            .replace("_", " ")
+            .replace("`", " ")
+            .replace("\u00A0", " ")
+            .replace("\u202F", " ")
+            .replace(Regex("""\s+"""), " ")
 
-        val encodedText = URLEncoder.encode(finalQuery, "UTF-8")
-        val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
-        val url = "https://serpapi.com/search.json?engine=yandex&yandex_domain=yandex.ru&lang=ru&lr=213&text=$encodedText&api_key=$encodedKey"
-
-        val request = Request.Builder().url(url).build()
-        client.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw RuntimeException("HTTP ${response.code} (проверь ключ SerpApi)")
-            }
-            val root = JSONObject(bodyStr)
-            val organic = root.optJSONArray("organic_results") ?: return emptyList()
-            val list = mutableListOf<ProductOffer>()
-            for (i in 0 until organic.length()) {
-                val item = organic.optJSONObject(i) ?: continue
-                val title = item.optString("title", "").trim()
-                val link = item.optString("link", "").trim()
-                if (title.isBlank() || link.isBlank()) continue
-
-                val snippet = item.optString("snippet", "").trim()
-                val priceRub = extractRubPriceFromText("$title $snippet")
-                val marketplace = detectMarketplace(link, title)
-
-                list.add(
-                    ProductOffer(
-                        id = "serpapi_ya_$i",
-                        title = cleanTitle(title),
-                        priceRub = priceRub,
-                        marketplace = marketplace,
-                        shopName = extractHostName(link),
-                        url = link,
-                        imageUrl = item.optString("thumbnail", "").ifBlank { null },
-                        snippet = snippet,
-                        sourceEngine = "Яндекс"
-                    )
-                )
-            }
-            return list
-        }
-    }
-
-    private fun parsePriceStringRub(raw: String): Int? {
-        if (raw.isBlank()) return null
-        if (FOREIGN_CURRENCY_REGEX.containsMatchIn(raw)) return null
-        val fromRegex = extractRubPriceFromText(raw)
-        if (fromRegex != null) return fromRegex
-        if (raw.contains("RUB", ignoreCase = true) || raw.contains("₽") || raw.contains("руб", ignoreCase = true)) {
-            val digits = raw.replace(Regex("""[.,]\d{1,2}\b"""), "").filter { it.isDigit() }
-            return digits.toIntOrNull()?.takeIf { it in 50..50_000_000 }
-        }
-        return null
-    }
-
-    fun extractRubPriceFromText(text: String): Int? {
         val candidates = mutableListOf<Int>()
+
         for (match in RUB_PRICE_REGEX.findAll(text)) {
-            val afterEnd = minOf(text.length, match.range.last + 18)
+            val afterEnd = minOf(text.length, match.range.last + 20)
             val after = text.substring(match.range.last + 1, afterEnd).lowercase()
+            // Игнорируем рассрочку/кредит "в мес" и "в нед"
             if (after.contains("мес") || after.contains("нед")) continue
 
             val digits = match.groupValues[1].filter { it.isDigit() }
@@ -571,6 +774,17 @@ private object PriceSearchEngine {
                 candidates.add(value)
             }
         }
+
+        if (candidates.isEmpty()) {
+            for (match in RUB_PREFIX_REGEX.findAll(text)) {
+                val digits = match.groupValues[1].filter { it.isDigit() }
+                val value = digits.toIntOrNull()
+                if (value != null && value in 50..50_000_000) {
+                    candidates.add(value)
+                }
+            }
+        }
+
         return candidates.minOrNull()
     }
 
@@ -707,10 +921,14 @@ fun PriceFinderApp() {
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("price_finder_prefs", Context.MODE_PRIVATE) }
 
+    var tavilyKey by remember { mutableStateOf(prefs.getString("tavily_key", "") ?: "") }
+    var serpKiteKey by remember { mutableStateOf(prefs.getString("serpkite_key", "") ?: "") }
     var serperKey by remember { mutableStateOf(prefs.getString("serper_key", "") ?: "") }
-    var serpApiKey by remember { mutableStateOf(prefs.getString("serpapi_key", "") ?: "") }
+
     var enableDirectWb by remember { mutableStateOf(prefs.getBoolean("enable_wb", true)) }
-    var enableSerperShopping by remember { mutableStateOf(prefs.getBoolean("enable_shopping", true)) }
+    var enableTavily by remember { mutableStateOf(prefs.getBoolean("enable_tavily", true)) }
+    var enableDuckDuckGo by remember { mutableStateOf(prefs.getBoolean("enable_ddg", true)) }
+
     var history by remember {
         val saved = prefs.getString("history_json", "[]") ?: "[]"
         val arr = try { JSONArray(saved) } catch (_: Exception) { JSONArray() }
@@ -769,9 +987,11 @@ fun PriceFinderApp() {
                 specs = trimmedSpecs,
                 selectedMarkets = selectedMarkets,
                 enableDirectWb = enableDirectWb,
-                enableSerperShopping = enableSerperShopping,
-                serperKey = serperKey,
-                serpApiKey = serpApiKey
+                enableTavily = enableTavily,
+                enableDuckDuckGo = enableDuckDuckGo,
+                tavilyKey = tavilyKey,
+                serpKiteKey = serpKiteKey,
+                serperKey = serperKey
             )
             rawOffers = outcome.offers
             notices = outcome.notices
@@ -814,11 +1034,12 @@ fun PriceFinderApp() {
         }
     }
 
-    val hasAnyApiKey = serperKey.isNotBlank() || serpApiKey.isNotBlank()
     val activeEnginesText = buildList {
         if (enableDirectWb) add("WB")
+        if (enableTavily) add(if (tavilyKey.isNotBlank()) "Tavily" else "Tavily(Free)")
+        if (enableDuckDuckGo) add("DDG")
+        if (serpKiteKey.isNotBlank()) add("SerpKite")
         if (serperKey.isNotBlank()) add("Serper")
-        if (serpApiKey.isNotBlank()) add("Яндекс")
     }.joinToString(" + ").ifBlank { "Выкл" }
 
     Scaffold(
@@ -829,14 +1050,16 @@ fun PriceFinderApp() {
                         Text("ЦенаПоиска", fontWeight = FontWeight.Bold, fontSize = 20.sp)
                         Text(
                             "Источники: $activeEnginesText",
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
                     IconButton(onClick = { showSettingsDialog = true }) {
-                        Icon(Icons.Default.Settings, contentDescription = "Настройки API")
+                        Icon(Icons.Default.Settings, contentDescription = "Настройки")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -970,7 +1193,7 @@ fun PriceFinderApp() {
                 }
             }
 
-            if (!hasAnyApiKey) {
+            if (tavilyKey.isBlank() && serpKiteKey.isBlank() && serperKey.isBlank()) {
                 item {
                     Card(
                         colors = CardDefaults.cardColors(
@@ -993,13 +1216,13 @@ fun PriceFinderApp() {
                             )
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    "Подключи Ozon, Я.Маркет, DNS и Авито",
+                                    "Готово к работе без ключей!",
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 13.sp,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
                                 Text(
-                                    "Сейчас работает прямой поиск Wildberries. Нажми сюда, чтобы вставить бесплатный ключ Serper.dev или SerpApi.",
+                                    "Поиск по WB, Ozon, Я.Маркет, DNS и Авито уже включён. Для Яндекса без SMS можно позже добавить ключ SerpKite (в ⚙️).",
                                     fontSize = 12.sp,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
@@ -1248,21 +1471,27 @@ fun PriceFinderApp() {
 
     if (showSettingsDialog) {
         SettingsDialog(
+            tavilyKey = tavilyKey,
+            serpKiteKey = serpKiteKey,
             serperKey = serperKey,
-            serpApiKey = serpApiKey,
             enableDirectWb = enableDirectWb,
-            enableSerperShopping = enableSerperShopping,
+            enableTavily = enableTavily,
+            enableDuckDuckGo = enableDuckDuckGo,
             onDismiss = { showSettingsDialog = false },
-            onSave = { newSerper, newSerpApi, newWb, newShop ->
+            onSave = { newTavily, newSerpKite, newSerper, newWb, newTavOn, newDdgOn ->
+                tavilyKey = newTavily.trim()
+                serpKiteKey = newSerpKite.trim()
                 serperKey = newSerper.trim()
-                serpApiKey = newSerpApi.trim()
                 enableDirectWb = newWb
-                enableSerperShopping = newShop
+                enableTavily = newTavOn
+                enableDuckDuckGo = newDdgOn
                 prefs.edit()
+                    .putString("tavily_key", tavilyKey)
+                    .putString("serpkite_key", serpKiteKey)
                     .putString("serper_key", serperKey)
-                    .putString("serpapi_key", serpApiKey)
                     .putBoolean("enable_wb", enableDirectWb)
-                    .putBoolean("enable_shopping", enableSerperShopping)
+                    .putBoolean("enable_tavily", enableTavily)
+                    .putBoolean("enable_ddg", enableDuckDuckGo)
                     .apply()
                 showSettingsDialog = false
             }
@@ -1338,6 +1567,13 @@ private fun ProductOfferCard(
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+
+                    Text(
+                        text = offer.sourceEngine,
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
+                    )
 
                     if (offer.rating != null) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1424,86 +1660,104 @@ private fun ProductOfferCard(
 
 @Composable
 private fun SettingsDialog(
+    tavilyKey: String,
+    serpKiteKey: String,
     serperKey: String,
-    serpApiKey: String,
     enableDirectWb: Boolean,
-    enableSerperShopping: Boolean,
+    enableTavily: Boolean,
+    enableDuckDuckGo: Boolean,
     onDismiss: () -> Unit,
-    onSave: (String, String, Boolean, Boolean) -> Unit
+    onSave: (String, String, String, Boolean, Boolean, Boolean) -> Unit
 ) {
     val context = LocalContext.current
-    var sKey by remember { mutableStateOf(serperKey) }
-    var yKey by remember { mutableStateOf(serpApiKey) }
+    var tKey by remember { mutableStateOf(tavilyKey) }
+    var skKey by remember { mutableStateOf(serpKiteKey) }
+    var srKey by remember { mutableStateOf(serperKey) }
     var wbOn by remember { mutableStateOf(enableDirectWb) }
-    var shopOn by remember { mutableStateOf(enableSerperShopping) }
+    var tavOn by remember { mutableStateOf(enableTavily) }
+    var ddgOn by remember { mutableStateOf(enableDuckDuckGo) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Настройки поиска", fontWeight = FontWeight.Bold) },
+        title = { Text("Настройки источников", fontWeight = FontWeight.Bold) },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                Text("Встроенные (работают без ключей):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                     Switch(checked = wbOn, onCheckedChange = { wbOn = it })
                     Spacer(Modifier.width(10.dp))
                     Column {
-                        Text("Wildberries напрямую", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                        Text("Работает без ключей и бесплатно", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Wildberries напрямую", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("Точные цены и фото", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Switch(checked = tavOn, onCheckedChange = { tavOn = it })
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("Tavily (Ozon, ЯМ, DNS, Авито)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("Работает сразу без ключа (Keyless)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Switch(checked = ddgOn, onCheckedChange = { ddgOn = it })
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("DuckDuckGo по магазинам РФ", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                        Text("Запасной поиск без ключей", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
 
                 HorizontalDivider()
 
-                Text("1. Serper.dev (Ozon, Я.Маркет, DNS, Ситилинк, Авито)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                Text("2 500 бесплатных поисков без карты", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("1. SerpKite — Яндекс поиск (без SMS!)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                Text("Вход через GitHub/Google · 2500 поисков сразу + 1000/мес", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 OutlinedTextField(
-                    value = sKey,
-                    onValueChange = { sKey = it },
-                    label = { Text("Serper API Key") },
+                    value = skKey,
+                    onValueChange = { skKey = it },
+                    label = { Text("SerpKite API Key (необяз.)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Row(
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    TextButton(onClick = { openExternalUrl(context, "https://serper.dev/") }) {
-                        Text("Получить ключ serper.dev ↗", fontSize = 12.sp)
-                    }
-                }
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Checkbox(checked = shopOn, onCheckedChange = { shopOn = it })
-                    Text("Включить Google Shopping (Serper)", fontSize = 12.sp)
+                TextButton(onClick = { openExternalUrl(context, "https://serpkite.com/") }) {
+                    Text("Получить ключ serpkite.com ↗", fontSize = 12.sp)
                 }
 
                 HorizontalDivider()
 
-                Text("2. SerpApi — Поиск через Яндекс (опционально)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                Text("250 бесплатных поисков каждый месяц, отлично находит магазины РФ", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("2. Tavily API Key (если упёрся в лимит Keyless)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                Text("Вход через Google без карты и телефона · 1000/мес", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 OutlinedTextField(
-                    value = yKey,
-                    onValueChange = { yKey = it },
-                    label = { Text("SerpApi Key") },
+                    value = tKey,
+                    onValueChange = { tKey = it },
+                    label = { Text("Tavily Key tvly-... (необяз.)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                TextButton(onClick = { openExternalUrl(context, "https://serpapi.com/") }) {
-                    Text("Получить ключ serpapi.com ↗", fontSize = 12.sp)
+                TextButton(onClick = { openExternalUrl(context, "https://app.tavily.com/") }) {
+                    Text("Получить ключ app.tavily.com ↗", fontSize = 12.sp)
                 }
+
+                HorizontalDivider()
+
+                Text("3. Serper Key (если есть)", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                OutlinedTextField(
+                    value = srKey,
+                    onValueChange = { srKey = it },
+                    label = { Text("Serper Key (необяз.)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         },
         confirmButton = {
-            Button(onClick = { onSave(sKey, yKey, wbOn, shopOn) }) {
+            Button(onClick = { onSave(tKey, skKey, srKey, wbOn, tavOn, ddgOn) }) {
                 Text("Сохранить")
             }
         },
